@@ -91,3 +91,23 @@ func TestParseInterval(t *testing.T) {
 		}
 	}
 }
+
+func TestFSRAllowsSnapshotDeletion(t *testing.T) {
+	fsrTestSetup(t)
+	sg := makeSG("foo", "default", true, []string{"az-a"})
+	newest := createSnapshotForTest(t, sg)
+
+	snapshots, err := ListSnapshots(sg)
+	assert.NoError(t, err)
+	assert.False(t, fsrAllowsSnapshotDeletion(sg, snapshots))
+
+	err = patchSnapshotAnnotations(newest, map[string]string{FSRStateAnnotation: FSRStateEnabled})
+	assert.NoError(t, err)
+	snapshots, err = ListSnapshots(sg)
+	assert.NoError(t, err)
+	assert.True(t, fsrAllowsSnapshotDeletion(sg, snapshots))
+
+	ready := false
+	snapshots[0].VolumeSnapshot.Status.ReadyToUse = &ready
+	assert.False(t, fsrAllowsSnapshotDeletion(sg, snapshots))
+}
