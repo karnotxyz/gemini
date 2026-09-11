@@ -58,6 +58,11 @@ func ReconcileBackupsForSnapshotGroup(sg *snapshotgroup.SnapshotGroup) error {
 	}
 	klog.V(3).Infof("%s/%s: going to create %d, delete %d snapshots", sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, len(toCreate), len(toDelete))
 
+	if len(toDelete) > 0 && !fsrAllowsSnapshotDeletion(sg, snapshots) {
+		klog.Infof("%s/%s: deferring deletion of %d expired snapshots until the newest snapshot is FSR-ready",
+			sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, len(toDelete))
+		toDelete = nil
+	}
 	err = deleteSnapshots(toDelete)
 	if err != nil {
 		return err
@@ -71,6 +76,21 @@ func ReconcileBackupsForSnapshotGroup(sg *snapshotgroup.SnapshotGroup) error {
 	klog.V(3).Infof("%s/%s: created %d snapshots", sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, len(toCreate))
 
 	return nil
+}
+
+// fsrAllowsSnapshotDeletion protects the N-2 recovery point while a newly
+// created snapshot is still becoming usable. The newest snapshot overall—not
+// merely the newest ReadyToUse snapshot—must have passed the AWS state and
+// credit gates in ReconcileFSR.
+func fsrAllowsSnapshotDeletion(sg *snapshotgroup.SnapshotGroup, snapshots []*GeminiSnapshot) bool {
+	if !fsrGlobalEnabled || sg.Spec.FastSnapshotRestore == nil || !sg.Spec.FastSnapshotRestore.Enabled {
+		return true
+	}
+	if len(snapshots) == 0 || snapshots[0].VolumeSnapshot == nil || snapshots[0].VolumeSnapshot.Status == nil {
+		return false
+	}
+	ready := snapshots[0].VolumeSnapshot.Status.ReadyToUse
+	return ready != nil && *ready && fsrState(snapshots[0]) == FSRStateEnabled
 }
 
 // RestoreSnapshotGroup restores the PV to a particular snapshot

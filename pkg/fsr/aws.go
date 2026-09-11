@@ -17,9 +17,13 @@ package fsr
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
+	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
@@ -31,9 +35,14 @@ type ec2API interface {
 	DescribeFastSnapshotRestores(ctx context.Context, params *ec2.DescribeFastSnapshotRestoresInput, optFns ...func(*ec2.Options)) (*ec2.DescribeFastSnapshotRestoresOutput, error)
 }
 
+type cloudWatchAPI interface {
+	GetMetricStatistics(ctx context.Context, params *cloudwatch.GetMetricStatisticsInput, optFns ...func(*cloudwatch.Options)) (*cloudwatch.GetMetricStatisticsOutput, error)
+}
+
 // awsClient implements Client against the real EC2 API.
 type awsClient struct {
-	ec2 ec2API
+	ec2        ec2API
+	cloudWatch cloudWatchAPI
 }
 
 // NewAWSClient builds a Client backed by aws-sdk-go-v2. Region and credentials
@@ -43,7 +52,10 @@ func NewAWSClient(ctx context.Context) (Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
-	return &awsClient{ec2: ec2.NewFromConfig(cfg)}, nil
+	return &awsClient{
+		ec2:        ec2.NewFromConfig(cfg),
+		cloudWatch: cloudwatch.NewFromConfig(cfg),
+	}, nil
 }
 
 func (c *awsClient) Enable(ctx context.Context, snapshotID string, azs []string) error {
@@ -148,4 +160,43 @@ func (c *awsClient) Describe(ctx context.Context, snapshotID string) ([]AZState,
 	return states, nil
 }
 
+func (c *awsClient) CreditsReady(ctx context.Context, snapshotID string, azs []string) (bool, error) {
+	for _, az := range azs {
+		end := time.Now()
+		start := end.Add(-10 * time.Minute)
+		out, err := c.cloudWatch.GetMetricStatistics(ctx, &cloudwatch.GetMetricStatisticsInput{
+			Namespace:  strPtr("AWS/EBS"),
+			MetricName: strPtr("FastSnapshotRestoreCreditsBalance"),
+			Dimensions: []cwtypes.Dimension{
+				{Name: strPtr("SnapshotId"), Value: strPtr(snapshotID)},
+				{Name: strPtr("AvailabilityZone"), Value: strPtr(az)},
+			},
+			StartTime:  &start,
+			EndTime:    &end,
+			Period:     int32Ptr(60),
+			Statistics: []cwtypes.Statistic{cwtypes.StatisticAverage},
+		})
+		if err != nil {
+			return false, fmt.Errorf("GetMetricStatistics(%s, %s): %w", snapshotID, az, err)
+		}
+		if len(out.Datapoints) == 0 {
+			return false, nil
+		}
+		sort.Slice(out.Datapoints, func(i, j int) bool {
+			if out.Datapoints[i].Timestamp == nil {
+				return false
+			}
+			if out.Datapoints[j].Timestamp == nil {
+				return true
+			}
+			return out.Datapoints[i].Timestamp.After(*out.Datapoints[j].Timestamp)
+		})
+		if out.Datapoints[0].Timestamp == nil || out.Datapoints[0].Average == nil || *out.Datapoints[0].Average < 1 {
+			return false, nil
+		}
+	}
+	return len(azs) > 0, nil
+}
+
 func strPtr(s string) *string { return &s }
+func int32Ptr(v int32) *int32 { return &v }

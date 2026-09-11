@@ -32,6 +32,11 @@ type FakeClient struct {
 	DisableErr error
 	// DescribeErr, if non-nil, is returned from the next Describe call.
 	DescribeErr error
+	// CreditsReadyValue defaults to true so existing state-machine tests model
+	// a full bucket. Set CreditsReadySet=true to exercise an empty bucket.
+	CreditsReadyValue bool
+	CreditsReadySet   bool
+	CreditsErr        error
 	// EnableCalls records every (snapshotID, azs) pair passed to Enable.
 	EnableCalls []EnableCall
 	// DisableCalls records every (snapshotID, azs) pair passed to Disable.
@@ -106,6 +111,20 @@ func (f *FakeClient) Describe(_ context.Context, snapshotID string) ([]AZState, 
 		out = append(out, AZState{AvailabilityZone: az, State: state})
 	}
 	return out, nil
+}
+
+func (f *FakeClient) CreditsReady(_ context.Context, _ string, _ []string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.CreditsErr != nil {
+		err := f.CreditsErr
+		f.CreditsErr = nil
+		return false, err
+	}
+	if !f.CreditsReadySet {
+		return true, nil
+	}
+	return f.CreditsReadyValue, nil
 }
 
 // SetState lets a test simulate AWS having warmed (or otherwise transitioned)

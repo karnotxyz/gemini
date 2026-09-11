@@ -35,15 +35,6 @@ import (
 // (~60min/TiB), so polling faster wastes API calls and requeue work.
 const FSRPollInterval = 60 * time.Second
 
-// FSREnableTimeout is the maximum time a snapshot may stay in fsr-state=enabling
-// before the reconciler gives up and writes fsr-state=failed.
-const FSREnableTimeout = 2 * time.Hour
-
-// FSRDisableTimeout is the maximum time a snapshot may stay in fsr-state=disabling
-// before the reconciler gives up and writes fsr-state=failed. Mirrors the enable
-// timeout; AWS disable is typically fast but network/throttling can stall it.
-const FSRDisableTimeout = 2 * time.Hour
-
 var (
 	fsrClient        fsr.Client
 	defaultFSRAZs    []string
@@ -72,22 +63,14 @@ func SetFSRGlobalEnabled(v bool) { fsrGlobalEnabled = v }
 // Zero means no time-based requeue is needed (state is steady or terminal);
 // the existing informer event path will pick up future changes.
 //
-// The reconcile runs in two passes:
+// AWS is authoritative on every pass. This lets Gemini recover from stale or
+// failed annotations and from a partial multi-AZ enable.
 //
-//  1. Enable pass (only if per-SG enabled=true): walk the newest ReadyToUse
-//     snapshot through absent -> enabling -> enabled. See reconcileEnable.
-//  2. Disable pass: walk every OTHER snapshot in the group through
-//     enabling/enabled -> disabling -> disabled, calling DisableFastSnapshotRestores
-//     once a replacement is warm (or the group has been opted out entirely).
-//     See reconcileDisable.
-//
-// Contract (matches .claude/feat/snapshot/hot-snapshot-scaleup-gemini.md §3.2):
-//   - absent    -> Enable, annotate "enabling" + fsr-enabled-at, requeue
-//   - enabling  -> Describe; warm -> "enabled"; > FSREnableTimeout -> "failed"; else requeue
-//   - enabled   -> no-op for the target; triggers disable of older peers
-//   - disabling -> Describe; cold -> "disabled"; > FSRDisableTimeout -> "failed"; else requeue
-//   - disabled  -> no-op (terminal; AWS state already cleared)
-//   - failed    -> no-op (terminal; manual intervention required)
+// Rotation order keeps one recoverable hot snapshot throughout:
+//  1. disable FSR on snapshots older than the immediately previous snapshot;
+//  2. enable/retry each missing AZ on the newest ReadyToUse snapshot;
+//  3. wait for AWS state=enabled and >=1 creation credit in every target AZ;
+//  4. only then disable FSR on the previous snapshot.
 func ReconcileFSR(sg *snapshotgroup.SnapshotGroup) (time.Duration, error) {
 	if !fsrGlobalEnabled {
 		return 0, nil
@@ -126,91 +109,180 @@ func ReconcileFSR(sg *snapshotgroup.SnapshotGroup) (time.Duration, error) {
 		return 0, fmt.Errorf("list snapshots: %w", err)
 	}
 
-	var (
-		target    *GeminiSnapshot
-		requeueE  time.Duration
-		enableErr error
-	)
-	if perSGEnabled {
-		target = newestReadyToUse(snapshots)
-		if target != nil {
-			requeueE, enableErr = reconcileEnable(sg, target, azs)
-			if enableErr != nil {
-				return 0, enableErr
-			}
-		}
+	if !perSGEnabled {
+		requeue, _, err := reconcileDisable(sg, snapshots, azs, true)
+		return requeue, err
 	}
 
-	// Gate: only initiate new disable transitions when it's safe to do so.
-	//   - per-SG enabled=false: user explicitly opted out; tear everything down.
-	//   - per-SG enabled=true:  only after the replacement target is warm; otherwise
-	//     we'd leave the group with no FSR coverage for minutes-to-hours.
-	canInitiateDisable := !perSGEnabled ||
-		(target != nil && fsrState(target) == FSRStateEnabled)
+	target := newestReadyToUse(snapshots)
+	if target == nil {
+		return 0, nil
+	}
+	previous := previousSnapshot(snapshots, target)
 
-	requeueD, err := reconcileDisable(sg, snapshots, target, azs, canInitiateDisable)
+	// Free quota held by N-2 and older before trying the newest snapshot. N-1 is
+	// deliberately preserved until the new snapshot has usable credits.
+	stale := snapshotsExcept(snapshots, target, previous)
+	requeueStale, staleCold, err := reconcileDisable(sg, stale, azs, true)
 	if err != nil {
 		return 0, err
 	}
-
-	return minNonZero(requeueE, requeueD), nil
-}
-
-// reconcileEnable advances the target snapshot through absent -> enabling -> enabled.
-func reconcileEnable(sg *snapshotgroup.SnapshotGroup, target *GeminiSnapshot, azs []string) (time.Duration, error) {
-	state := fsrState(target)
-	switch state {
-	case "":
-		return startEnable(sg, target, azs)
-	case FSRStateEnabling:
-		return pollEnable(sg, target, azs)
-	case FSRStateEnabled, FSRStateFailed, FSRStateDisabled:
-		return 0, nil
-	case FSRStateDisabling:
-		// Target should be the newest; it arriving in "disabling" means something
-		// (a human? a prior teardown pass?) already started to tear it down. We
-		// won't race that — leave it alone and let the disable-pass poller finish.
-		klog.Warningf("%s/%s: newest ready snapshot %s is in fsr-state=disabling; skipping enable",
-			sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, target.Name)
-		return 0, nil
-	default:
-		klog.Warningf("%s/%s: snapshot %s has unknown fsr-state=%q; treating as absent",
-			sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, target.Name, state)
-		return startEnable(sg, target, azs)
+	if !staleCold {
+		return minNonZero(requeueStale, FSRPollInterval), nil
 	}
+
+	requeueEnable, err := reconcileEnable(sg, target, azs)
+	if err != nil {
+		return 0, err
+	}
+	if fsrState(target) != FSRStateEnabled {
+		return minNonZero(requeueStale, requeueEnable), nil
+	}
+
+	if previous == nil {
+		return minNonZero(requeueStale, requeueEnable), nil
+	}
+	requeuePrevious, _, err := reconcileDisable(sg, []*GeminiSnapshot{previous}, azs, true)
+	if err != nil {
+		return 0, err
+	}
+	return minNonZero(minNonZero(requeueStale, requeueEnable), requeuePrevious), nil
 }
 
-// reconcileDisable walks every snapshot in the group except target:
-//   - {enabling, enabled}: if canInitiate, call Disable and annotate "disabling"
-//   - {disabling}: poll AWS; cold everywhere -> "disabled"; timeout -> "failed"
-//
-// Returns the tightest requeue duration needed by any polling branch.
-func reconcileDisable(sg *snapshotgroup.SnapshotGroup, snapshots []*GeminiSnapshot, target *GeminiSnapshot, azs []string, canInitiate bool) (time.Duration, error) {
+// reconcileEnable converges the newest snapshot from AWS state rather than
+// trusting annotations. Missing AZs are enabled one at a time so one quota
+// failure cannot hide a successful sibling and every missing AZ is retried.
+func reconcileEnable(sg *snapshotgroup.SnapshotGroup, target *GeminiSnapshot, azs []string) (time.Duration, error) {
+	snapshotID, err := resolveSnapshotID(target)
+	if err != nil {
+		return FSRPollInterval, nil
+	}
+	states, err := fsrClient.Describe(context.TODO(), snapshotID)
+	if err != nil {
+		return 0, fmt.Errorf("FSR Describe(%s): %w", snapshotID, err)
+	}
+
+	missing := fsr.MissingAZs(states, azs)
+	if len(missing) > 0 {
+		// A target already moving toward disabled must finish that transition
+		// before AWS will accept a fresh enable request.
+		if !fsr.IsColdInAll(states, missing) {
+			return FSRPollInterval, nil
+		}
+		now := strconv.FormatInt(time.Now().Unix(), 10)
+		if err := patchSnapshotAnnotations(target, map[string]string{
+			FSRStateAnnotation:     FSRStateEnabling,
+			FSREnabledAtAnnotation: now,
+		}); err != nil {
+			return 0, fmt.Errorf("annotate %s as enabling: %w", target.Name, err)
+		}
+		for _, az := range missing {
+			if err := fsrClient.Enable(context.TODO(), snapshotID, []string{az}); err != nil {
+				return 0, fmt.Errorf("FSR Enable(%s, %s): %w", snapshotID, az, err)
+			}
+		}
+		return FSRPollInterval, nil
+	}
+
+	if !fsr.IsWarmInAll(states, azs) {
+		return FSRPollInterval, nil
+	}
+	creditsReady, err := fsrClient.CreditsReady(context.TODO(), snapshotID, azs)
+	if err != nil {
+		return 0, fmt.Errorf("FSR credits(%s): %w", snapshotID, err)
+	}
+	if !creditsReady {
+		if fsrState(target) != FSRStateEnabling {
+			if err := patchSnapshotAnnotations(target, map[string]string{FSRStateAnnotation: FSRStateEnabling}); err != nil {
+				return 0, fmt.Errorf("annotate %s as enabling: %w", target.Name, err)
+			}
+		}
+		return FSRPollInterval, nil
+	}
+	if fsrState(target) != FSRStateEnabled {
+		if err := patchSnapshotAnnotations(target, map[string]string{FSRStateAnnotation: FSRStateEnabled}); err != nil {
+			return 0, fmt.Errorf("annotate %s as enabled: %w", target.Name, err)
+		}
+	}
+	return 0, nil
+}
+
+// reconcileDisable converges each supplied snapshot to cold in every target AZ.
+// The bool result is true only when all snapshots are already fully disabled.
+func reconcileDisable(sg *snapshotgroup.SnapshotGroup, snapshots []*GeminiSnapshot, azs []string, canInitiate bool) (time.Duration, bool, error) {
 	var requeue time.Duration
+	allCold := true
 	for _, snap := range snapshots {
-		if target != nil && snap.Name == target.Name && snap.Namespace == target.Namespace {
+		snapshotID, err := resolveSnapshotID(snap)
+		if err != nil {
+			allCold = false
+			requeue = minNonZero(requeue, FSRPollInterval)
 			continue
 		}
-		state := fsrState(snap)
-		switch state {
-		case FSRStateEnabling, FSRStateEnabled:
-			if !canInitiate {
-				continue
+		states, err := fsrClient.Describe(context.TODO(), snapshotID)
+		if err != nil {
+			return 0, false, fmt.Errorf("FSR Describe(%s): %w", snapshotID, err)
+		}
+		if fsr.IsColdInAll(states, azs) {
+			if fsrState(snap) != FSRStateDisabled {
+				if err := patchSnapshotAnnotations(snap, map[string]string{FSRStateAnnotation: FSRStateDisabled}); err != nil {
+					return 0, false, fmt.Errorf("annotate %s as disabled: %w", snap.Name, err)
+				}
 			}
-			d, err := startDisable(sg, snap, azs)
-			if err != nil {
-				return 0, err
-			}
-			requeue = minNonZero(requeue, d)
-		case FSRStateDisabling:
-			d, err := pollDisable(sg, snap, azs)
-			if err != nil {
-				return 0, err
-			}
-			requeue = minNonZero(requeue, d)
+			continue
+		}
+
+		allCold = false
+		requeue = minNonZero(requeue, FSRPollInterval)
+		if !canInitiate {
+			continue
+		}
+		active := fsr.ActiveAZs(states, azs)
+		if len(active) == 0 {
+			// AWS is already in the disabling transition; only poll.
+			continue
+		}
+		if fsrState(snap) == FSRStateDisabling {
+			continue
+		}
+		if err := fsrClient.Disable(context.TODO(), snapshotID, active); err != nil {
+			return 0, false, fmt.Errorf("FSR Disable(%s): %w", snapshotID, err)
+		}
+		now := strconv.FormatInt(time.Now().Unix(), 10)
+		if err := patchSnapshotAnnotations(snap, map[string]string{
+			FSRStateAnnotation:      FSRStateDisabling,
+			FSRDisabledAtAnnotation: now,
+		}); err != nil {
+			return 0, false, fmt.Errorf("annotate %s as disabling: %w", snap.Name, err)
 		}
 	}
-	return requeue, nil
+	return requeue, allCold, nil
+}
+
+func previousSnapshot(snapshots []*GeminiSnapshot, target *GeminiSnapshot) *GeminiSnapshot {
+	for i, snap := range snapshots {
+		if snap.Name == target.Name && snap.Namespace == target.Namespace && i+1 < len(snapshots) {
+			return snapshots[i+1]
+		}
+	}
+	return nil
+}
+
+func snapshotsExcept(snapshots []*GeminiSnapshot, excluded ...*GeminiSnapshot) []*GeminiSnapshot {
+	out := make([]*GeminiSnapshot, 0, len(snapshots))
+	for _, snap := range snapshots {
+		skip := false
+		for _, item := range excluded {
+			if item != nil && snap.Name == item.Name && snap.Namespace == item.Namespace {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			out = append(out, snap)
+		}
+	}
+	return out
 }
 
 // fsrState reads the fsr-state annotation off a snapshot (empty string if unset).
@@ -249,142 +321,6 @@ func newestReadyToUse(snapshots []*GeminiSnapshot) *GeminiSnapshot {
 		}
 	}
 	return nil
-}
-
-func startEnable(sg *snapshotgroup.SnapshotGroup, snap *GeminiSnapshot, azs []string) (time.Duration, error) {
-	snapshotID, err := resolveSnapshotID(snap)
-	if err != nil {
-		// VSC may not have published snapshotHandle yet even though ReadyToUse=true.
-		// Requeue and try again.
-		klog.V(3).Infof("%s/%s: cannot resolve AWS snapshot ID for %s yet: %v",
-			sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, snap.Name, err)
-		return FSRPollInterval, nil
-	}
-	klog.V(3).Infof("%s/%s: enabling FSR on %s (snapshotID=%s, azs=%v)",
-		sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, snap.Name, snapshotID, azs)
-	if err := fsrClient.Enable(context.TODO(), snapshotID, azs); err != nil {
-		// Transient AWS errors: don't write "failed", let workqueue rate-limiter retry.
-		return 0, fmt.Errorf("FSR Enable(%s): %w", snapshotID, err)
-	}
-	now := strconv.FormatInt(time.Now().Unix(), 10)
-	if err := patchSnapshotAnnotations(snap, map[string]string{
-		FSRStateAnnotation:     FSRStateEnabling,
-		FSREnabledAtAnnotation: now,
-	}); err != nil {
-		return 0, fmt.Errorf("annotate %s as enabling: %w", snap.Name, err)
-	}
-	return FSRPollInterval, nil
-}
-
-func pollEnable(sg *snapshotgroup.SnapshotGroup, snap *GeminiSnapshot, azs []string) (time.Duration, error) {
-	snapshotID, err := resolveSnapshotID(snap)
-	if err != nil {
-		return FSRPollInterval, nil
-	}
-	states, err := fsrClient.Describe(context.TODO(), snapshotID)
-	if err != nil {
-		return 0, fmt.Errorf("FSR Describe(%s): %w", snapshotID, err)
-	}
-	if fsr.IsWarmInAll(states, azs) {
-		klog.V(3).Infof("%s/%s: FSR warm on %s in all target AZs", sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, snap.Name)
-		if err := patchSnapshotAnnotations(snap, map[string]string{
-			FSRStateAnnotation: FSRStateEnabled,
-		}); err != nil {
-			return 0, fmt.Errorf("annotate %s as enabled: %w", snap.Name, err)
-		}
-		return 0, nil
-	}
-	// Not warm yet. Check timeout.
-	startedAt, ok := parseFSREnabledAt(snap)
-	if ok && time.Since(startedAt) > FSREnableTimeout {
-		klog.Warningf("%s/%s: FSR on %s exceeded %s warmup timeout; marking failed",
-			sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, snap.Name, FSREnableTimeout)
-		if err := patchSnapshotAnnotations(snap, map[string]string{
-			FSRStateAnnotation: FSRStateFailed,
-		}); err != nil {
-			return 0, fmt.Errorf("annotate %s as failed: %w", snap.Name, err)
-		}
-		return 0, nil
-	}
-	return FSRPollInterval, nil
-}
-
-func parseFSREnabledAt(snap *GeminiSnapshot) (time.Time, bool) {
-	raw := snap.VolumeSnapshot.ObjectMeta.Annotations[FSREnabledAtAnnotation]
-	if raw == "" {
-		return time.Time{}, false
-	}
-	n, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return time.Unix(n, 0), true
-}
-
-func startDisable(sg *snapshotgroup.SnapshotGroup, snap *GeminiSnapshot, azs []string) (time.Duration, error) {
-	snapshotID, err := resolveSnapshotID(snap)
-	if err != nil {
-		klog.V(3).Infof("%s/%s: cannot resolve AWS snapshot ID for %s yet: %v",
-			sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, snap.Name, err)
-		return FSRPollInterval, nil
-	}
-	klog.V(3).Infof("%s/%s: disabling FSR on %s (snapshotID=%s, azs=%v)",
-		sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, snap.Name, snapshotID, azs)
-	if err := fsrClient.Disable(context.TODO(), snapshotID, azs); err != nil {
-		return 0, fmt.Errorf("FSR Disable(%s): %w", snapshotID, err)
-	}
-	now := strconv.FormatInt(time.Now().Unix(), 10)
-	if err := patchSnapshotAnnotations(snap, map[string]string{
-		FSRStateAnnotation:      FSRStateDisabling,
-		FSRDisabledAtAnnotation: now,
-	}); err != nil {
-		return 0, fmt.Errorf("annotate %s as disabling: %w", snap.Name, err)
-	}
-	return FSRPollInterval, nil
-}
-
-func pollDisable(sg *snapshotgroup.SnapshotGroup, snap *GeminiSnapshot, azs []string) (time.Duration, error) {
-	snapshotID, err := resolveSnapshotID(snap)
-	if err != nil {
-		return FSRPollInterval, nil
-	}
-	states, err := fsrClient.Describe(context.TODO(), snapshotID)
-	if err != nil {
-		return 0, fmt.Errorf("FSR Describe(%s): %w", snapshotID, err)
-	}
-	if fsr.IsColdInAll(states, azs) {
-		klog.V(3).Infof("%s/%s: FSR cold on %s in all target AZs", sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, snap.Name)
-		if err := patchSnapshotAnnotations(snap, map[string]string{
-			FSRStateAnnotation: FSRStateDisabled,
-		}); err != nil {
-			return 0, fmt.Errorf("annotate %s as disabled: %w", snap.Name, err)
-		}
-		return 0, nil
-	}
-	startedAt, ok := parseFSRDisabledAt(snap)
-	if ok && time.Since(startedAt) > FSRDisableTimeout {
-		klog.Warningf("%s/%s: FSR disable on %s exceeded %s cooldown timeout; marking failed",
-			sg.ObjectMeta.Namespace, sg.ObjectMeta.Name, snap.Name, FSRDisableTimeout)
-		if err := patchSnapshotAnnotations(snap, map[string]string{
-			FSRStateAnnotation: FSRStateFailed,
-		}); err != nil {
-			return 0, fmt.Errorf("annotate %s as failed: %w", snap.Name, err)
-		}
-		return 0, nil
-	}
-	return FSRPollInterval, nil
-}
-
-func parseFSRDisabledAt(snap *GeminiSnapshot) (time.Time, bool) {
-	raw := snap.VolumeSnapshot.ObjectMeta.Annotations[FSRDisabledAtAnnotation]
-	if raw == "" {
-		return time.Time{}, false
-	}
-	n, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return time.Unix(n, 0), true
 }
 
 // resolveSnapshotID maps a Gemini-managed VolumeSnapshot to its AWS EBS snapshot

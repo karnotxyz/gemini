@@ -117,8 +117,9 @@ func TestReconcileFSR_AbsentTransitionsToEnabling(t *testing.T) {
 	requeue, err := ReconcileFSR(sg)
 	assert.NoError(t, err)
 	assert.Equal(t, FSRPollInterval, requeue)
-	assert.Len(t, fake.EnableCalls, 1)
-	assert.Equal(t, []string{"az-a", "az-b"}, fake.EnableCalls[0].AZs)
+	assert.Len(t, fake.EnableCalls, 2)
+	assert.Equal(t, []string{"az-a"}, fake.EnableCalls[0].AZs)
+	assert.Equal(t, []string{"az-b"}, fake.EnableCalls[1].AZs)
 
 	// The annotation should now be "enabling".
 	snaps, err := ListSnapshots(sg)
@@ -194,25 +195,84 @@ func TestReconcileFSR_PartialWarm_StaysEnabling(t *testing.T) {
 	assert.Equal(t, FSRStateEnabling, snaps[0].VolumeSnapshot.ObjectMeta.Annotations[FSRStateAnnotation])
 }
 
-func TestReconcileFSR_TimeoutTransitionsToFailed(t *testing.T) {
-	fsrTestSetup(t)
+func TestReconcileFSR_QuotaSafeRotationRecoversPartialNewest(t *testing.T) {
+	fake := fsrTestSetup(t)
+	sg := makeSG("foo", "default", true, []string{"az-a", "az-b"})
+
+	oldest := createSnapshotWithState(t, sg, FSRStateEnabled)
+	oldestID, _ := resolveSnapshotID(oldest)
+	fake.SetState(oldestID, "az-a", "enabled")
+	fake.SetState(oldestID, "az-b", "enabled")
+
+	time.Sleep(1100 * time.Millisecond)
+	previous := createSnapshotWithState(t, sg, FSRStateEnabled)
+	previousID, _ := resolveSnapshotID(previous)
+	fake.SetState(previousID, "az-a", "enabled")
+	fake.SetState(previousID, "az-b", "enabled")
+
+	time.Sleep(1100 * time.Millisecond)
+	target := createSnapshotWithState(t, sg, FSRStateFailed)
+	targetID, _ := resolveSnapshotID(target)
+	fake.SetState(targetID, "az-a", "enabled")
+
+	// First free the N-2 quota slots, preserving N-1 and the partially hot N.
+	requeue, err := ReconcileFSR(sg)
+	assert.NoError(t, err)
+	assert.Equal(t, FSRPollInterval, requeue)
+	assert.Len(t, fake.DisableCalls, 1)
+	assert.Equal(t, oldestID, fake.DisableCalls[0].SnapshotID)
+	assert.Empty(t, fake.EnableCalls)
+
+	// Once N-2 is cold, retry only the missing AZ on N.
+	fake.SetState(oldestID, "az-a", "disabled")
+	fake.SetState(oldestID, "az-b", "disabled")
+	_, err = ReconcileFSR(sg)
+	assert.NoError(t, err)
+	assert.Len(t, fake.EnableCalls, 1)
+	assert.Equal(t, targetID, fake.EnableCalls[0].SnapshotID)
+	assert.Equal(t, []string{"az-b"}, fake.EnableCalls[0].AZs)
+	assert.Len(t, fake.DisableCalls, 1, "N-1 remains hot during N warmup")
+
+	// AWS enabled is not enough: retain N-1 until a volume creation credit is
+	// available in both AZs.
+	fake.SetState(targetID, "az-b", "enabled")
+	fake.CreditsReadySet = true
+	fake.CreditsReadyValue = false
+	_, err = ReconcileFSR(sg)
+	assert.NoError(t, err)
+	assert.Len(t, fake.DisableCalls, 1)
+	gotTarget, _ := GetSnapshot("default", target.Name)
+	assert.Equal(t, FSRStateEnabling, gotTarget.VolumeSnapshot.ObjectMeta.Annotations[FSRStateAnnotation])
+
+	// Full credits complete the handover and only then retire N-1.
+	fake.CreditsReadyValue = true
+	_, err = ReconcileFSR(sg)
+	assert.NoError(t, err)
+	assert.Len(t, fake.DisableCalls, 2)
+	assert.Equal(t, previousID, fake.DisableCalls[1].SnapshotID)
+	gotTarget, _ = GetSnapshot("default", target.Name)
+	assert.Equal(t, FSRStateEnabled, gotTarget.VolumeSnapshot.ObjectMeta.Annotations[FSRStateAnnotation])
+}
+
+func TestReconcileFSR_FailedAnnotationIsRecovered(t *testing.T) {
+	fake := fsrTestSetup(t)
 	sg := makeSG("foo", "default", true, []string{"az-a"})
 	snap := createSnapshotForTest(t, sg)
 
-	// Simulate that we issued Enable >2h ago: write the annotation by hand.
-	longAgo := strconv.FormatInt(time.Now().Add(-3*time.Hour).Unix(), 10)
+	// A previous controller timed out after a quota failure. AWS remains the
+	// source of truth, so the terminal-looking annotation must not strand it.
 	err := patchSnapshotAnnotations(snap, map[string]string{
-		FSRStateAnnotation:     FSRStateEnabling,
-		FSREnabledAtAnnotation: longAgo,
+		FSRStateAnnotation: FSRStateFailed,
 	})
 	assert.NoError(t, err)
 
 	requeue, err := ReconcileFSR(sg)
 	assert.NoError(t, err)
-	assert.Equal(t, time.Duration(0), requeue)
+	assert.Equal(t, FSRPollInterval, requeue)
+	assert.Len(t, fake.EnableCalls, 1)
 
 	snaps, _ := ListSnapshots(sg)
-	assert.Equal(t, FSRStateFailed, snaps[0].VolumeSnapshot.ObjectMeta.Annotations[FSRStateAnnotation])
+	assert.Equal(t, FSRStateEnabling, snaps[0].VolumeSnapshot.ObjectMeta.Annotations[FSRStateAnnotation])
 }
 
 func TestReconcileFSR_EnableErrorBubbles(t *testing.T) {
@@ -226,9 +286,10 @@ func TestReconcileFSR_EnableErrorBubbles(t *testing.T) {
 	assert.Error(t, err)
 	assert.Equal(t, time.Duration(0), requeue)
 
-	// No annotation should have been written.
+	// The retryable annotation is retained so the next reconciliation can resume
+	// from AWS state without treating the error as terminal.
 	snaps, _ := ListSnapshots(sg)
-	assert.Empty(t, snaps[0].VolumeSnapshot.ObjectMeta.Annotations[FSRStateAnnotation])
+	assert.Equal(t, FSRStateEnabling, snaps[0].VolumeSnapshot.ObjectMeta.Annotations[FSRStateAnnotation])
 }
 
 func TestReconcileFSR_AlreadyEnabled_NoOp(t *testing.T) {
@@ -238,6 +299,9 @@ func TestReconcileFSR_AlreadyEnabled_NoOp(t *testing.T) {
 
 	err := patchSnapshotAnnotations(snap, map[string]string{FSRStateAnnotation: FSRStateEnabled})
 	assert.NoError(t, err)
+	snapshotID, err := resolveSnapshotID(snap)
+	assert.NoError(t, err)
+	fake.SetState(snapshotID, "az-a", "enabled")
 
 	requeue, err := ReconcileFSR(sg)
 	assert.NoError(t, err)
@@ -441,7 +505,7 @@ func TestReconcileFSR_DisablingCleared_TransitionsToDisabled(t *testing.T) {
 	assert.Equal(t, FSRStateDisabled, gotOlder.VolumeSnapshot.ObjectMeta.Annotations[FSRStateAnnotation])
 }
 
-func TestReconcileFSR_DisableTimeoutTransitionsToFailed(t *testing.T) {
+func TestReconcileFSR_DisableTimeoutRemainsRetryable(t *testing.T) {
 	fake := fsrTestSetup(t)
 	sg := makeSG("foo", "default", true, []string{"az-a"})
 
@@ -465,7 +529,7 @@ func TestReconcileFSR_DisableTimeoutTransitionsToFailed(t *testing.T) {
 	assert.NoError(t, err)
 
 	gotOlder, _ := GetSnapshot("default", older.Name)
-	assert.Equal(t, FSRStateFailed, gotOlder.VolumeSnapshot.ObjectMeta.Annotations[FSRStateAnnotation])
+	assert.Equal(t, FSRStateDisabling, gotOlder.VolumeSnapshot.ObjectMeta.Annotations[FSRStateAnnotation])
 }
 
 func TestReconcileFSR_DisableErrorBubbles(t *testing.T) {

@@ -44,6 +44,48 @@ type Client interface {
 	// slice contains exactly one entry per AZ that AWS knows about for this
 	// snapshot; AZs with no record are omitted.
 	Describe(ctx context.Context, snapshotID string) ([]AZState, error)
+
+	// CreditsReady reports whether every requested snapshot/AZ credit bucket has
+	// at least one volume-creation credit. AWS can report FSR as enabled before
+	// the first credit has accumulated, so this is the final readiness gate before
+	// Gemini retires the previous hot snapshot.
+	CreditsReady(ctx context.Context, snapshotID string, availabilityZones []string) (bool, error)
+}
+
+// MissingAZs returns requested AZs that are not already in an active FSR state.
+// Enabling and optimizing entries are deliberately treated as active so the
+// reconciler polls them instead of submitting duplicate enable requests.
+func MissingAZs(states []AZState, requestedAZs []string) []string {
+	byAZ := make(map[string]string, len(states))
+	for _, s := range states {
+		byAZ[s.AvailabilityZone] = s.State
+	}
+	missing := make([]string, 0, len(requestedAZs))
+	for _, az := range requestedAZs {
+		switch byAZ[az] {
+		case "enabling", "optimizing", "enabled":
+		default:
+			missing = append(missing, az)
+		}
+	}
+	return missing
+}
+
+// ActiveAZs returns requested AZs whose FSR lifecycle still consumes (or is
+// acquiring) a quota slot and therefore needs an explicit disable request.
+func ActiveAZs(states []AZState, requestedAZs []string) []string {
+	byAZ := make(map[string]string, len(states))
+	for _, s := range states {
+		byAZ[s.AvailabilityZone] = s.State
+	}
+	active := make([]string, 0, len(requestedAZs))
+	for _, az := range requestedAZs {
+		switch byAZ[az] {
+		case "enabling", "optimizing", "enabled":
+			active = append(active, az)
+		}
+	}
+	return active
 }
 
 // IsWarmInAll reports whether the snapshot is in AWS state "enabled" in every
@@ -79,7 +121,7 @@ func IsColdInAll(states []AZState, requestedAZs []string) bool {
 	}
 	for _, az := range requestedAZs {
 		switch byAZ[az] {
-		case "enabled", "enabling", "optimizing":
+		case "enabled", "enabling", "optimizing", "disabling":
 			return false
 		}
 	}
